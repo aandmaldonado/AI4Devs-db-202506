@@ -1,11 +1,11 @@
--- Consultas de validación y rendimiento para el sistema de reclutamiento (PascalCase, quoted)
+-- Consultas de validación y rendimiento para el sistema de reclutamiento (PascalCase, quoted, optimizadas)
 
 -- 1. Listar todas las posiciones abiertas con información de la empresa, tipo de empleo, status y ubicación
 SELECT p."id", p."title", s."name" AS status, c."name" AS company, f."description" AS interview_flow, et."name" AS employment_type, l."name" AS location
 FROM "Position" p
+JOIN "Status" s ON p."statusId" = s."id"
 JOIN "Company" c ON p."companyId" = c."id"
 JOIN "InterviewFlow" f ON p."interviewFlowId" = f."id"
-JOIN "Status" s ON p."statusId" = s."id"
 JOIN "EmploymentType" et ON p."employmentTypeId" = et."id"
 JOIN "Location" l ON p."locationId" = l."id"
 WHERE s."name" = 'Abierta';
@@ -51,17 +51,19 @@ LEFT JOIN "Interview" i ON emp."id" = i."employeeId"
 GROUP BY emp."id", emp."name", r."name"
 ORDER BY total_entrevistas DESC;
 
--- 7. Consulta de rendimiento: obtener el tiempo promedio entre la aplicación y la primera entrevista por candidato
+-- 7. Consulta de rendimiento: obtener el tiempo promedio entre la aplicación y la primera entrevista por candidato (optimizada con CTE)
+WITH first_steps AS (
+  SELECT istep."interviewFlowId", MIN(istep."id") AS first_step_id
+  FROM "InterviewStep" istep
+  GROUP BY istep."interviewFlowId"
+)
 SELECT cand."id", cand."firstName", cand."lastName",
        AVG(i."interviewDate" - app."applicationDate") AS avg_dias_espera
 FROM "Candidate" cand
 JOIN "Application" app ON cand."id" = app."candidateId"
-JOIN "Interview" i ON app."id" = i."applicationId"
-WHERE i."interviewStepId" = (
-    SELECT MIN(istep."id") FROM "InterviewStep" istep WHERE istep."interviewFlowId" = (
-        SELECT p."interviewFlowId" FROM "Position" p WHERE p."id" = app."positionId"
-    )
-)
+JOIN "Position" p ON app."positionId" = p."id"
+JOIN first_steps fs ON p."interviewFlowId" = fs."interviewFlowId"
+JOIN "Interview" i ON app."id" = i."applicationId" AND i."interviewStepId" = fs.first_step_id
 GROUP BY cand."id", cand."firstName", cand."lastName";
 
 -- 8. Consulta de validación: obtener todas las posiciones y el número de aplicaciones recibidas
@@ -79,27 +81,33 @@ JOIN "Position" p ON pb."positionId" = p."id"
 JOIN "Benefit" b ON pb."benefitId" = b."id"
 ORDER BY p."title", b."name";
 
--- 10. Ranking de candidatos por número de entrevistas aprobadas
+-- 10. Ranking de candidatos por número de entrevistas aprobadas (optimizada)
 SELECT cand."id", cand."firstName", cand."lastName", COUNT(i."id") AS entrevistas_aprobadas
 FROM "Candidate" cand
 JOIN "Application" app ON cand."id" = app."candidateId"
-JOIN "Interview" i ON app."id" = i."applicationId"
-WHERE i."result" = 'Aprobado'
+JOIN "Interview" i ON app."id" = i."applicationId" AND i."result" = 'Aprobado'
 GROUP BY cand."id", cand."firstName", cand."lastName"
 ORDER BY entrevistas_aprobadas DESC
 LIMIT 10;
 
--- 11. Tiempo promedio de contratación por posición (días entre aplicación y última entrevista aprobada con resultado 'Contratada')
-SELECT p."title", AVG(i."interviewDate" - app."applicationDate") AS avg_dias_contratacion
+-- 11. Tiempo promedio de contratación por posición (días entre aplicación y última entrevista aprobada con resultado 'Contratada') (optimizada)
+WITH last_interviews AS (
+  SELECT app."id" AS application_id, MAX(i."interviewDate") AS last_interview_date
+  FROM "Application" app
+  JOIN "Interview" i ON app."id" = i."applicationId"
+  WHERE i."result" = 'Aprobado'
+  GROUP BY app."id"
+)
+SELECT p."title", AVG(li.last_interview_date - app."applicationDate") AS avg_dias_contratacion
 FROM "Position" p
 JOIN "Application" app ON p."id" = app."positionId"
-JOIN "Interview" i ON app."id" = i."applicationId"
+JOIN last_interviews li ON app."id" = li.application_id
 JOIN "Status" s ON app."statusId" = s."id"
-WHERE s."name" = 'Contratada' AND i."result" = 'Aprobado'
+WHERE s."name" = 'Contratada'
 GROUP BY p."title"
 ORDER BY avg_dias_contratacion;
 
--- 12. Top beneficios más ofrecidos en posiciones abiertas
+-- 12. Top beneficios más ofrecidos en posiciones abiertas (optimizada)
 SELECT b."name" AS benefit, COUNT(pb."positionId") AS total_posiciones
 FROM "Benefit" b
 JOIN "PositionBenefit" pb ON b."id" = pb."benefitId"
@@ -110,8 +118,10 @@ GROUP BY b."name"
 ORDER BY total_posiciones DESC
 LIMIT 5;
 
--- 13. Tasa de conversión de aplicaciones a contrataciones por posición
-SELECT p."title", COUNT(app."id") FILTER (WHERE s."name" = 'Contratada')::float / NULLIF(COUNT(app."id"),0) AS tasa_conversion
+-- 13. Tasa de conversión de aplicaciones a contrataciones por posición (optimizada)
+SELECT p."title",
+  CASE WHEN COUNT(app."id") = 0 THEN 0
+       ELSE COUNT(app."id") FILTER (WHERE s."name" = 'Contratada')::float / COUNT(app."id") END AS tasa_conversion
 FROM "Position" p
 LEFT JOIN "Application" app ON p."id" = app."positionId"
 LEFT JOIN "Status" s ON app."statusId" = s."id"
